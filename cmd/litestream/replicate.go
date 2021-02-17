@@ -10,7 +10,6 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"os/signal"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -27,8 +26,12 @@ type ReplicateCommand struct {
 	DBs []*litestream.DB
 }
 
-// Run loads all databases specified in the configuration.
-func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
+func NewReplicateCommand() *ReplicateCommand {
+	return &ReplicateCommand{}
+}
+
+// ParseFlags parses the CLI flags and loads the configuration file.
+func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	tracePath := fs.String("trace", "", "trace path")
 	registerConfigFlag(fs, &c.ConfigPath)
@@ -38,7 +41,6 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration or use CLI args to build db/replica.
-	var config Config
 	if fs.NArg() == 1 {
 		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
 	} else if fs.NArg() > 1 {
@@ -49,10 +51,9 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 				SyncInterval: 1 * time.Second,
 			})
 		}
-		config.DBs = []*DBConfig{dbConfig}
+		c.Config.DBs = []*DBConfig{dbConfig}
 	} else if c.ConfigPath != "" {
-		config, err = ReadConfigFile(c.ConfigPath)
-		if err != nil {
+		if c.Config, err = ReadConfigFile(c.ConfigPath); err != nil {
 			return err
 		}
 	} else {
@@ -69,21 +70,22 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 		litestream.Tracef = log.New(f, "", log.LstdFlags|log.LUTC|log.Lshortfile).Printf
 	}
 
-	// Setup signal handler.
-	ctx, cancel := context.WithCancel(ctx)
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt)
-	go func() { <-ch; cancel() }()
+	return nil
+}
+
+// Run loads all databases specified in the configuration.
+func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
+	// TODO(windows): Use eventlog instead of using fmt.Print()
 
 	// Display version information.
 	fmt.Printf("litestream %s\n", Version)
 
-	if len(config.DBs) == 0 {
+	if len(c.Config.DBs) == 0 {
 		fmt.Println("no databases specified in configuration")
 	}
 
-	for _, dbConfig := range config.DBs {
-		db, err := newDBFromConfig(&config, dbConfig)
+	for _, dbConfig := range c.Config.DBs {
+		db, err := newDBFromConfig(&c.Config, dbConfig)
 		if err != nil {
 			return err
 		}
@@ -111,25 +113,18 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Serve metrics over HTTP if enabled.
-	if config.Addr != "" {
-		_, port, _ := net.SplitHostPort(config.Addr)
+	if c.Config.Addr != "" {
+		// TODO(windows): Only register endpoints once.
+		// TODO(windows): Save listener so we can close it on Close()
+
+		_, port, _ := net.SplitHostPort(c.Config.Addr)
 		fmt.Printf("serving metrics on http://localhost:%s/metrics\n", port)
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(config.Addr, nil); err != nil {
+			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
 				log.Printf("cannot start metrics server: %s", err)
 			}
 		}()
-	}
-
-	// Wait for signal to stop program.
-	<-ctx.Done()
-	signal.Reset()
-
-	// Gracefully close
-	if err := c.Close(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
 	}
 
 	return nil
@@ -145,6 +140,7 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
+	// TODO(windows): Clear DBs
 	return err
 }
 
